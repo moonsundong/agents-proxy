@@ -6,6 +6,7 @@
 """
 
 import asyncio
+import contextlib
 import json
 import re
 import time
@@ -16,6 +17,7 @@ from dataclasses import dataclass
 import httpx
 from loguru import logger
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.clients import llm_client
@@ -91,22 +93,22 @@ async def _compression_reference_model(db: AsyncSession) -> LLMModel | None:
 
 async def _log_prepare_cancel(req: ChatCompletionRequest, start: float) -> None:
     """准备阶段被客户端中断的最小化日志(此时还没有路由结果可记)。"""
-    async with async_session_factory() as session:
-        session.add(
-            RequestLog(
-                request_id=uuid.uuid4().hex[:12],
-                model_id=None,
-                model_name=None,
-                route=None,
-                confidence=None,
-                route_reason=None,
-                request_excerpt=_request_excerpt(req.messages),
-                latency_ms=int((time.perf_counter() - start) * 1000),
-                status="cancelled",
-                error="客户端在压缩/决策阶段中断(准备耗时过长)",
-            )
-        )
-        await session.commit()
+    await _insert_log(
+        request_id=uuid.uuid4().hex[:12],
+        model_id=None,
+        model_name=None,
+        route=None,
+        confidence=None,
+        route_reason=None,
+        request_excerpt=_request_excerpt(req.messages),
+        original_tokens=None,
+        compressed_tokens=None,
+        prompt_tokens=None,
+        completion_tokens=None,
+        latency_ms=int((time.perf_counter() - start) * 1000),
+        status="cancelled",
+        error="客户端在压缩/决策阶段中断(准备耗时过长)",
+    )
 
 
 async def _prepare(
@@ -142,6 +144,11 @@ async def _prepare(
 # 请求摘录的字符上限:够对照路由判断即可,避免日志表膨胀
 _EXCERPT_LIMIT = 1000
 
+# SQLite 单写者串行化 + 锁冲突重试参数
+_LOG_WRITE_LOCK = asyncio.Lock()
+_LOG_WRITE_MAX_ATTEMPTS = 3
+_LOG_WRITE_RETRY_BACKOFF = 0.5
+
 
 def _request_excerpt(messages: list[dict]) -> str:
     """最后一条用户消息的截断摘录(原始请求,非压缩后),供日志页对照路由。"""
@@ -172,6 +179,55 @@ class LogContext:
     start: float
 
 
+async def _insert_log(**fields) -> None:
+    """串行写入一条 request_logs,锁冲突时退避重试。
+
+    SQLite 是单写者:本进程的并发写只会互相制造 database is locked,
+    用模块级锁串行化;WAL 下剩余的锁冲突只应来自检查点等瞬时事件,重试可恢复。
+    """
+    async with _LOG_WRITE_LOCK:
+        for attempt in range(_LOG_WRITE_MAX_ATTEMPTS):
+            try:
+                async with async_session_factory() as session:
+                    session.add(RequestLog(**fields))
+                    await session.commit()
+                return
+            except OperationalError as exc:
+                if (
+                    "locked" not in str(exc).lower()
+                    or attempt == _LOG_WRITE_MAX_ATTEMPTS - 1
+                ):
+                    raise
+                await asyncio.sleep(_LOG_WRITE_RETRY_BACKOFF * (2**attempt))
+
+
+def _log_fields(
+    ctx: LogContext,
+    *,
+    status: str,
+    latency_ms: int,
+    prompt_tokens: int | None = None,
+    completion_tokens: int | None = None,
+    error: str | None = None,
+) -> dict:
+    return {
+        "request_id": ctx.request_id,
+        "model_id": ctx.model.id,
+        "model_name": ctx.model.name,
+        "route": ctx.route,
+        "confidence": ctx.confidence,
+        "route_reason": ctx.route_reason,
+        "request_excerpt": ctx.excerpt,
+        "original_tokens": ctx.compression.original_tokens,
+        "compressed_tokens": ctx.compression.compressed_tokens,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "latency_ms": latency_ms,
+        "status": status,
+        "error": error,
+    }
+
+
 async def write_log(
     ctx: LogContext,
     *,
@@ -181,27 +237,34 @@ async def write_log(
     completion_tokens: int | None = None,
     error: str | None = None,
 ) -> None:
-    """用独立会话写请求日志,避免与请求级会话的生命周期耦合。"""
-    async with async_session_factory() as session:
-        session.add(
-            RequestLog(
-                request_id=ctx.request_id,
-                model_id=ctx.model.id,
-                model_name=ctx.model.name,
-                route=ctx.route,
-                confidence=ctx.confidence,
-                route_reason=ctx.route_reason,
-                request_excerpt=ctx.excerpt,
-                original_tokens=ctx.compression.original_tokens,
-                compressed_tokens=ctx.compression.compressed_tokens,
+    """写请求日志(取消安全)。
+
+    客户端断开时 uvicorn 会直接取消正在 await 本函数的请求任务;取消若落在
+    commit 中途,aiosqlite 连接会带着未完结事务泄漏,写锁永不释放,之后所有
+    日志写全部 database is locked(2026-09-24 日志黑洞事故根因)。因此实际
+    写入放进独立任务并用 shield 屏蔽调用方取消:调用方被取消时写入仍在后台
+    完成,失败由 _on_log_task_done 记录可见。
+    """
+    task = asyncio.create_task(
+        _insert_log(
+            **_log_fields(
+                ctx,
+                status=status,
+                latency_ms=latency_ms,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
-                latency_ms=latency_ms,
-                status=status,
                 error=error,
             )
         )
-        await session.commit()
+    )
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_on_log_task_done)
+    try:
+        await asyncio.shield(task)
+    except OperationalError as exc:
+        # 写日志失败不应让请求本身报错;失败已由 _on_log_task_done 记录
+        # (CancelledError 是 BaseException,不在此处拦截,正常向上传播)
+        logger.warning("请求日志写入失败(已放弃): {}", exc)
 
 
 # 取消路径上的日志写入不能随请求任务一起被取消,用火记忘任务兜底
@@ -218,7 +281,7 @@ def _on_log_task_done(task: asyncio.Task) -> None:
 def _log_in_background(ctx: LogContext, *, status: str, error: str) -> None:
     latency = int((time.perf_counter() - ctx.start) * 1000)
     task = asyncio.create_task(
-        write_log(ctx, status=status, latency_ms=latency, error=error)
+        _insert_log(**_log_fields(ctx, status=status, latency_ms=latency, error=error))
     )
     _BACKGROUND_TASKS.add(task)
     task.add_done_callback(_on_log_task_done)
@@ -399,9 +462,19 @@ async def _with_keepalive(model: LLMModel, payload: dict) -> AsyncGenerator[byte
             task = None
             yield chunk
     finally:
-        if task is not None and not task.done():
-            task.cancel()
-        await stream.aclose()
+        if task is not None:
+            if not task.done():
+                task.cancel()
+                # 等上游迭代任务真正结束再 aclose:aclose 与 pending 的
+                # __anext__ 并发会抛 "asynchronous generator is already
+                # running"(uvicorn 侧断连时就踩过),导致上游流泄漏
+                with contextlib.suppress(Exception):
+                    await asyncio.wait({task}, timeout=2)
+            if task.done() and not task.cancelled():
+                # 取回异常标记已消费,避免 "Task exception was never retrieved"
+                task.exception()
+        with contextlib.suppress(Exception):
+            await stream.aclose()
 
 
 async def stream_generator(sc: StreamContext) -> AsyncGenerator[bytes, None]:
