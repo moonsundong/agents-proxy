@@ -170,7 +170,8 @@ async def evaluate_complexity(
             return None
         message = resp.json()["choices"][0]["message"]
     except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as exc:
-        logger.warning("决策模型调用失败: {}", exc)
+        # 注意用 repr:httpx 的超时异常 str() 是空串,直接插值会打出空日志
+        logger.warning("决策模型调用失败: {!r}", exc)
         return None
     # 推理型模型可能把 JSON 留在 reasoning_content 而 content 为空(预算被思考耗尽)
     info = _parse_decision(message.get("content") or "")
