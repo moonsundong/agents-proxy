@@ -1,0 +1,28 @@
+# ---- Python ----
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# ---- Node / 前端 ----
+node_modules/
+ai-proxy-frontend/dist/
+
+# ---- 运行时数据 ----
+api_gateway/gateway.db*
+api_gateway/logs/
+*.log
+
+# ---- 环境变量(含密钥) ----
+.env
+api_gateway/.env
+
+# ---- 编辑器 / 工具 ----
+.vscode/
+.codegraph/
+.idea/
+
+# ---- 系统 ----
+Thumbs.db
+Desktop.ini

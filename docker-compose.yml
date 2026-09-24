@@ -1,0 +1,42 @@
+# LLM Agent 代理网关一键部署(文档第九节)
+# 用法: docker compose up -d --build
+services:
+  backend:
+    build: ./api_gateway
+    ports:
+      - "8300:8300"
+    environment:
+      # 生产切换 PostgreSQL 时取消下行注释,并给 requirements 增加 asyncpg
+      # GATEWAY_DATABASE_URL: postgresql+asyncpg://gateway:gateway@db:5432/gateway
+      GATEWAY_LOG_LEVEL: INFO
+      GATEWAY_CORS_ORIGINS: http://localhost:5188
+      # Headroom Kompress 模型权重缓存(挂卷持久化,避免容器重建后重复下载)
+      GATEWAY_HF_HOME: /hf-cache
+    volumes:
+      - gateway-data:/data
+      - hf-cache:/hf-cache
+    restart: unless-stopped
+
+  frontend:
+    build: ./ai-proxy-frontend
+    ports:
+      - "5188:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  # 生产用 PostgreSQL(可选,默认 SQLite):
+  # db:
+  #   image: postgres:16-alpine
+  #   environment:
+  #     POSTGRES_USER: gateway
+  #     POSTGRES_PASSWORD: gateway
+  #     POSTGRES_DB: gateway
+  #   volumes:
+  #     - pg-data:/var/lib/postgresql/data
+  #   restart: unless-stopped
+
+volumes:
+  gateway-data:
+  hf-cache:
+  # pg-data:

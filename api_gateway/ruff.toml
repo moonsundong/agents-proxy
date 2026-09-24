@@ -1,0 +1,4 @@
+# Ruff 配置:FastAPI 项目的规则豁免
+[lint]
+# B008: FastAPI 标准用法 db: AsyncSession = Depends(get_db) 必然在默认值里调用函数
+ignore = ["B008"]
