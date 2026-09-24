@@ -902,3 +902,34 @@ async def test_stream_prepare_error_returns_json(client: AsyncClient) -> None:
     )
     assert resp.status_code == 503
     assert resp.json()["error"]["code"] == "NO_AVAILABLE_MODEL"
+
+
+# ---------------------------------------------------- 决策输出解析(截断挽救)
+
+
+async def test_parse_decision_truncated_json_salvaged() -> None:
+    """推理型模型预算耗尽导致 JSON 截断(无右括号)时,正则打捞 confidence。"""
+    from app.services.decision_service import _parse_decision
+
+    info = _parse_decision('{"confidence": 0.45, "complexity": "medium", "reason": "请求包含多步')
+    assert info is not None
+    assert info.confidence == 0.45
+    assert "打捞" in (info.reason or "")
+
+
+async def test_parse_decision_complete_json_unchanged() -> None:
+    """完整 JSON 仍走正常解析,且打捞逻辑不干扰。"""
+    from app.services.decision_service import _parse_decision
+
+    info = _parse_decision('前言 {"confidence": 0.8, "complexity": "simple", "reason": "问答"} 后记')
+    assert info is not None
+    assert info.confidence == 0.8
+    assert info.reason == "问答"
+
+
+async def test_parse_decision_unrecoverable_returns_none() -> None:
+    """content 为空且无任何 confidence 字样时返回 None,由上层降级。"""
+    from app.services.decision_service import _parse_decision
+
+    assert _parse_decision("") is None
+    assert _parse_decision("模型拒绝回答") is None

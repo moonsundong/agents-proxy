@@ -67,11 +67,20 @@ def _ensure_supported(model: LLMModel) -> None:
         )
 
 
-async def chat_completion(model: LLMModel, payload: dict) -> httpx.Response:
-    """非流式调用,返回原始响应(由调用方决定透传或解析)。"""
+async def chat_completion(
+    model: LLMModel, payload: dict, timeout: httpx.Timeout | None = None
+) -> httpx.Response:
+    """非流式调用,返回原始响应(由调用方决定透传或解析)。
+
+    timeout 可按调用覆盖(如决策模型用更长的 decision_timeout);
+    None 时使用共享客户端的默认 request_timeout。
+    """
     _ensure_supported(model)
     return await get_client().post(
-        _chat_url(model), json=payload, headers=_headers(model)
+        _chat_url(model),
+        json=payload,
+        headers=_headers(model),
+        timeout=timeout if timeout is not None else httpx.USE_CLIENT_DEFAULT,
     )
 
 

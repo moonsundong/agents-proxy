@@ -18,6 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.clients import llm_client
+from app.config.settings import settings
 from app.models.llm_model import LLMModel, ModelType
 from app.models.routing_policy import RoutingPolicy
 from app.schemas.routing import DecisionInfo
@@ -42,9 +43,10 @@ _DEFAULT_HEAD_RATIO = 0.2
 # 字符/token 保守换算:中文约 1 token/字,取 1.5 保证截断后不溢出窗口
 _CHARS_PER_TOKEN = 1.5
 
-# 决策输出 token 上限:推理型模型(reasoning_content)会先消耗预算再输出正文,
-# 200 这类小上限会导致复杂请求下正文被截断/为空,评估失败保守走线上
-_DECISION_MAX_TOKENS = 1024
+# 决策输出 token 上限的兜底:推理型模型(reasoning_content)会先消耗预算再
+# 输出正文,小上限会导致正文被截断/为空,评估失败保守走线上。
+# 实际值读 settings.decision_max_tokens(默认 4096),此常量仅作导入期兜底
+_DECISION_MAX_TOKENS_FALLBACK = 1024
 
 # 决策请求里 system prompt + 消息模板的 token 预留
 _DECISION_PROMPT_RESERVE = 512
@@ -101,7 +103,8 @@ def _content_limit_for(model: LLMModel, policy: RoutingPolicy | None = None) -> 
     (全量评估大上下文会让评估本身成为分钟级瓶颈);线上模型评估快,
     直接按窗口安全上限放行,看清完整上下文才能评得准。
     """
-    safe_tokens = model.context_window - _DECISION_MAX_TOKENS - _DECISION_PROMPT_RESERVE
+    max_tokens = getattr(settings, "decision_max_tokens", _DECISION_MAX_TOKENS_FALLBACK)
+    safe_tokens = model.context_window - max_tokens - _DECISION_PROMPT_RESERVE
     safe_limit = int(safe_tokens * _CHARS_PER_TOKEN)
     if model.type == ModelType.LOCAL:
         cap = policy.decision_content_limit if policy else _DEFAULT_CONTENT_LIMIT
@@ -135,27 +138,40 @@ def _build_decision_payload(
             {"role": "user", "content": f"请评估以下请求:\n{sampled}"},
         ],
         "temperature": 0,
-        "max_tokens": _DECISION_MAX_TOKENS,
+        "max_tokens": getattr(settings, "decision_max_tokens", _DECISION_MAX_TOKENS_FALLBACK),
         "stream": False,
     }
     return payload
 
 
 def _parse_decision(content: str) -> DecisionInfo | None:
-    """从决策模型输出中解析 JSON;宽容处理前后多余文本。"""
+    """从决策模型输出中解析 JSON;宽容处理前后多余文本与截断。
+
+    推理型模型的输出预算常被思考耗尽,JSON 可能写到一半被截断(没有右括号),
+    此时 confidence 字段往往已经写完——用正则单独打捞,避免整次评估作废。
+    """
     match = re.search(r"\{.*\}", content, re.DOTALL)
-    if not match:
-        return None
-    try:
-        data = json.loads(match.group(0))
-        confidence = float(data["confidence"])
-    except (ValueError, KeyError, TypeError):
-        return None
-    return DecisionInfo(
-        confidence=max(0.0, min(1.0, confidence)),
-        complexity=data.get("complexity"),
-        reason=data.get("reason"),
-    )
+    if match:
+        try:
+            data = json.loads(match.group(0))
+            confidence = float(data["confidence"])
+        except (ValueError, KeyError, TypeError):
+            confidence = None
+        if confidence is not None:
+            return DecisionInfo(
+                confidence=max(0.0, min(1.0, confidence)),
+                complexity=data.get("complexity"),
+                reason=data.get("reason"),
+            )
+    # 截断挽救:JSON 不完整,但 confidence 字段可能已完整输出
+    salvage = re.search(r'"confidence"\s*:\s*([0-9]*\.?[0-9]+)', content)
+    if salvage:
+        confidence = float(salvage.group(1))
+        return DecisionInfo(
+            confidence=max(0.0, min(1.0, confidence)),
+            reason="(输出被截断,confidence 由正则打捞)",
+        )
+    return None
 
 
 async def evaluate_complexity(
@@ -163,8 +179,10 @@ async def evaluate_complexity(
 ) -> DecisionInfo | None:
     """调用决策模型评估请求;任何失败(网络/解析)返回 None 由上层降级。"""
     payload = _build_decision_payload(decision_model, messages, policy)
+    # 决策用专用超时:本地推理型模型评估要先"思考",默认 request_timeout 不够
+    timeout = httpx.Timeout(settings.decision_timeout)
     try:
-        resp = await llm_client.chat_completion(decision_model, payload)
+        resp = await llm_client.chat_completion(decision_model, payload, timeout=timeout)
         if resp.status_code != 200:
             logger.warning("决策模型返回 HTTP {}", resp.status_code)
             return None

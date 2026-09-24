@@ -38,6 +38,12 @@ class Settings(BaseSettings):
     circuit_failure_threshold: int = 3  # 连续失败多少次后熔断
     circuit_cooldown_seconds: float = 30.0  # 熔断后冷却时间(秒)
 
+    # 决策模型调用:专用超时与推理预算。
+    # 本地推理型模型(如 bonsai2)评估要先"思考",request_timeout=60s 经常不够;
+    # max_tokens 太小会被思考耗尽导致正文为空/JSON 截断
+    decision_timeout: float = 180.0
+    decision_max_tokens: int = 4096
+
     # HuggingFace 缓存目录(Headroom Kompress 模型权重下载位置),
     # 需在 headroom 首次导入前生效;None 表示用系统默认 ~/.cache/huggingface
     hf_home: str | None = None

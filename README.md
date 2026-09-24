@@ -187,6 +187,8 @@ resp = client.chat.completions.create(
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `GATEWAY_REQUEST_TIMEOUT` | `60` | 上游 LLM 调用超时(秒) |
+| `GATEWAY_DECISION_TIMEOUT` | `180` | 决策模型专用超时(秒),本地推理型模型评估慢,需要更长 |
+| `GATEWAY_DECISION_MAX_TOKENS` | `4096` | 决策输出预算,推理型模型太小会被思考耗尽导致评估失败 |
 | `GATEWAY_LLM_MAX_RETRIES` | `2` | 失败重试次数(429/5xx/传输错误) |
 | `GATEWAY_LLM_RETRY_BACKOFF` | `0.5` | 重试退避基数(秒,指数增长) |
 | `GATEWAY_CIRCUIT_FAILURE_THRESHOLD` | `3` | 连续失败多少次后熔断该模型 |
