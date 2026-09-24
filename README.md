@@ -24,7 +24,7 @@
 你写代码、用 AI 工具时，每个请求都要花钱（API 调用费）或花时间（等模型回复）。
 这个网关夹在**你的工具**和**大模型**中间，自动做两件事：
 
-1. **🗜️ 压缩** — 把冗长的上下文（比如几十轮对话、大段工具输出）压小再发给模型，**直接省 Token 费**
+1. **🗜️ 压缩** — 基于 [Headroom](https://github.com/headroomlabs-ai/headroom) 上下文优化引擎，把冗长的上下文（比如几十轮对话、大段工具输出）压小再发给模型，**直接省 Token 费**（官方数据可省 50~90%）
 2. **🧠 路由** — 先让一个轻量"决策模型"判断这题难不难：**简单 → 本地模型（免费）**，**难 → 线上大模型（保质量）**
 
 > 所有兼容 OpenAI API 的工具（Codex、Claude Code、Chatbox、自研脚本……）只需把请求地址改成网关地址，立刻生效，**工具本身零改动**。
@@ -36,7 +36,7 @@
 | 功能 | 说明 |
 | --- | --- |
 | 🔌 **OpenAI 兼容** | 标准 `POST /v1/chat/completions`,支持 SSE 流式,任何 OpenAI 兼容客户端即插即用 |
-| 🗜️ **Headroom 压缩** | 上下文压缩引擎,策略可配(全开/关闭/仅压缩工具输出),压缩失败自动降级直通,**不影响可用性** |
+| 🗜️ **Headroom 压缩** | 集成 [Headroom](https://github.com/headroomlabs-ai/headroom) 上下文优化引擎,策略可配(全开/关闭/仅压缩工具输出),压缩失败自动降级直通,**不影响可用性** |
 | 🧠 **智能决策路由** | 决策模型输出置信度:≥ 阈值走本地,< 阈值走线上;支持手动指定模型、场景化策略、A/B 分流 |
 | 🛡️ **稳定性** | 指数退避重试 + 按模型熔断,上游抽风时自动保护 |
 | 📊 **可视化仪表盘** | 请求量、节省 Token 数、路由分布、趋势图,一目了然 |
@@ -282,6 +282,14 @@ npm run build && npm run lint
 
 - 熔断器与压缩配置缓存为进程内存态,多实例部署时各自独立(如需共享可引入 Redis)
 - 首次执行真实压缩会从 HuggingFace 下载 Kompress 模型权重(失败自动降级直通)
+
+## 🙏 致谢
+
+本项目的上下文压缩能力来自以下优秀的开源项目:
+
+- **[Headroom](https://github.com/headroomlabs-ai/headroom)** — The Context Optimization Layer for LLM Applications,官方数据可削减 50~90% 的上下文成本。本网关的压缩引擎即由 [`headroom-ai`](https://docs.headroomlabs.ai) 驱动,感谢 Headroom Labs 团队的开源贡献!
+
+同时感谢这些基石项目:[FastAPI](https://fastapi.tiangolo.com/)、[Vue.js](https://vuejs.org/)、[Element Plus](https://element-plus.org/)、[ECharts](https://echarts.apache.org/)、[SQLAlchemy](https://www.sqlalchemy.org/)、[llama.cpp](https://github.com/ggml-org/llama.cpp)。
 
 ## 🤝 贡献
 
