@@ -1,5 +1,6 @@
 """决策路由测试:决策模型评估、阈值路由、A/B 分流、降级兜底、策略 CRUD。"""
 
+import asyncio
 import json
 from collections.abc import AsyncGenerator
 from types import SimpleNamespace
@@ -143,6 +144,14 @@ async def _create_policy(client: AsyncClient, ids: dict[str, int], **overrides) 
 
 
 async def _logs() -> list[RequestLog]:
+    """读取日志;流式路径的日志是后台任务写入,先排干再读,避免竞态。"""
+    from app.services import proxy_service
+
+    for _ in range(20):
+        tasks = [t for t in proxy_service._BACKGROUND_TASKS if not t.done()]
+        if not tasks:
+            break
+        await asyncio.gather(*tasks, return_exceptions=True)
     async with async_session_factory() as session:
         result = await session.execute(select(RequestLog))
         return list(result.scalars().all())

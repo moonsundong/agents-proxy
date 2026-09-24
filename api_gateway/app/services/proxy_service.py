@@ -177,6 +177,9 @@ class LogContext:
     compression: CompressOutcome
     excerpt: str
     start: float
+    # 是否已提交过日志:由 write_log/_log_in_background 在派发时置位,
+    # 取消路径据此避免重复补记(同一条请求日志写两次)
+    logged: bool = False
 
 
 async def _insert_log(**fields) -> None:
@@ -257,6 +260,7 @@ async def write_log(
             )
         )
     )
+    ctx.logged = True  # 派发即置位:即使随后被取消,取消路径也不会重复补记
     _BACKGROUND_TASKS.add(task)
     task.add_done_callback(_on_log_task_done)
     try:
@@ -278,10 +282,27 @@ def _on_log_task_done(task: asyncio.Task) -> None:
         logger.error("后台写请求日志失败: {}", exc)
 
 
-def _log_in_background(ctx: LogContext, *, status: str, error: str) -> None:
+def _log_in_background(
+    ctx: LogContext,
+    *,
+    status: str,
+    error: str | None = None,
+    prompt_tokens: int | None = None,
+    completion_tokens: int | None = None,
+) -> None:
+    ctx.logged = True
     latency = int((time.perf_counter() - ctx.start) * 1000)
     task = asyncio.create_task(
-        _insert_log(**_log_fields(ctx, status=status, latency_ms=latency, error=error))
+        _insert_log(
+            **_log_fields(
+                ctx,
+                status=status,
+                latency_ms=latency,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                error=error,
+            )
+        )
     )
     _BACKGROUND_TASKS.add(task)
     task.add_done_callback(_on_log_task_done)
@@ -374,8 +395,11 @@ async def chat_completion(
             code="UPSTREAM_UNAVAILABLE",
         )
     except asyncio.CancelledError:
-        # 客户端中断(取消/重连):不算上游故障,不计熔断,记录后重抛
-        _log_in_background(ctx, status="cancelled", error="客户端中断连接")
+        # 客户端中断(取消/重连):不算上游故障,不计熔断。
+        # 取消若落在 write_log 的 shield 等待上,日志其实已派发成功,
+        # 这里补记会造成同一条请求两行日志——以 ctx.logged 判重
+        if not ctx.logged:
+            _log_in_background(ctx, status="cancelled", error="客户端中断连接")
         raise
 
 
@@ -417,12 +441,7 @@ async def prepare_stream(db: AsyncSession, req: ChatCompletionRequest) -> Stream
     )
     breaker = get_breaker(model.id)
     if breaker.is_open:
-        await write_log(
-            ctx,
-            status="error",
-            latency_ms=int((time.perf_counter() - ctx.start) * 1000),
-            error="熔断器开路,请求被拒绝",
-        )
+        _log_in_background(ctx, status="error", error="熔断器开路,请求被拒绝")
         raise AppError(
             message=f"模型 {model.name} 连续失败已熔断,请稍后再试",
             status_code=503,
@@ -485,7 +504,6 @@ async def stream_generator(sc: StreamContext) -> AsyncGenerator[bytes, None]:
     stream_started = False
     usage: dict = {}
     last_exc: Exception | None = None
-    logged = False
     finish_seen = False  # 客户端是否已拿到完整响应(非 null finish_reason)
 
     try:
@@ -501,14 +519,14 @@ async def stream_generator(sc: StreamContext) -> AsyncGenerator[bytes, None]:
                     prev_chunk = chunk
                     yield chunk
                 breaker.record_success()
-                await write_log(
+                # _log_in_background 派发即置位 ctx.logged:
+                # 客户端拿到 finish_reason 后随时断开,取消路径不会重复补记
+                _log_in_background(
                     ctx,
                     status="success",
-                    latency_ms=int((time.perf_counter() - ctx.start) * 1000),
                     prompt_tokens=usage.get("prompt_tokens"),
                     completion_tokens=usage.get("completion_tokens"),
                 )
-                logged = True
                 return
             except (llm_client.UpstreamError, httpx.HTTPError) as exc:
                 last_exc = exc
@@ -521,13 +539,9 @@ async def stream_generator(sc: StreamContext) -> AsyncGenerator[bytes, None]:
                 ):
                     # 不可重试的上游错误:透传状态码与错误体
                     breaker.record_failure()
-                    await write_log(
-                        ctx,
-                        status="error",
-                        latency_ms=int((time.perf_counter() - ctx.start) * 1000),
-                        error=f"upstream HTTP {exc.status_code}",
+                    _log_in_background(
+                        ctx, status="error", error=f"upstream HTTP {exc.status_code}"
                     )
-                    logged = True
                     yield _sse_raw(exc.body)
                     return
                 if attempt < settings.llm_max_retries:
@@ -535,16 +549,10 @@ async def stream_generator(sc: StreamContext) -> AsyncGenerator[bytes, None]:
                 continue
 
         breaker.record_failure()
-        await write_log(
-            ctx,
-            status="error",
-            latency_ms=int((time.perf_counter() - ctx.start) * 1000),
-            error=f"流式调用失败: {last_exc}",
-        )
-        logged = True
+        _log_in_background(ctx, status="error", error=f"流式调用失败: {last_exc}")
         yield _sse_error(f"流式调用失败(已重试 {settings.llm_max_retries} 次): {last_exc}", "STREAM_FAILED")
     finally:
-        if not logged:
+        if not ctx.logged:
             if finish_seen:
                 # 客户端拿到 finish_reason 后主动关闭(不等尾部的 usage/[DONE]),
                 # 响应其实已完整交付,算成功而不是取消

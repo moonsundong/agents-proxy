@@ -1,5 +1,6 @@
 """转发引擎测试:MockTransport 模拟上游,进程内 ASGI 测试(不起真实服务)。"""
 
+import asyncio
 import json
 from collections.abc import AsyncGenerator
 from types import SimpleNamespace
@@ -97,6 +98,14 @@ async def _seed_model(client: AsyncClient, **overrides) -> dict:
 
 
 async def _logs() -> list[RequestLog]:
+    """读取日志;流式路径的日志是后台任务写入,先排干再读,避免竞态。"""
+    from app.services import proxy_service
+
+    for _ in range(20):
+        tasks = [t for t in proxy_service._BACKGROUND_TASKS if not t.done()]
+        if not tasks:
+            break
+        await asyncio.gather(*tasks, return_exceptions=True)
     async with async_session_factory() as session:
         result = await session.execute(select(RequestLog))
         return list(result.scalars().all())
