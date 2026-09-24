@@ -74,7 +74,7 @@
 **前置要求**:Python 3.12+、Node.js 20+(Windows / macOS / Linux 均可)
 
 ```bash
-git clone https://github.com/<你的用户名>/agents-proxy.git
+git clone https://github.com/moonsundong/agents-proxy.git
 cd agents-proxy
 ./start.sh        # macOS / Linux / Git Bash
 # Windows 用户也可以直接双击 start.bat
