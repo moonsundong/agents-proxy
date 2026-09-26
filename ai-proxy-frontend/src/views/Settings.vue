@@ -91,10 +91,14 @@ async function remove(row: CCSwitchEndpoint) {
   await fetchEndpoints();
 }
 
-async function toggleEnabled(row: CCSwitchEndpoint) {
-  await updateEndpoint(row.id, { is_enabled: row.is_enabled });
-  ElMessage.success(row.is_enabled ? "已启用" : "已停用");
-  await fetchEndpoints();
+async function toggleEnabled(row: CCSwitchEndpoint, val: boolean) {
+  try {
+    await updateEndpoint(row.id, { is_enabled: val });
+    row.is_enabled = val;
+    ElMessage.success(val ? "已启用" : "已停用");
+  } catch {
+    ElMessage.error("操作失败,请重试");
+  }
 }
 
 // ---------------- 导入/导出 ----------------
@@ -185,7 +189,10 @@ async function onImportFile(event: Event) {
     </el-table-column>
     <el-table-column label="启用" width="70">
       <template #default="{ row }">
-        <el-switch :model-value="row.is_enabled" @change="toggleEnabled(row)" />
+        <el-switch
+          :model-value="row.is_enabled"
+          @change="(val: boolean) => toggleEnabled(row, val)"
+        />
       </template>
     </el-table-column>
     <el-table-column label="操作" width="150" fixed="right">

@@ -159,10 +159,14 @@ async function remove(row: LLMModel) {
   await store.fetchModels();
 }
 
-async function toggleEnabled(row: LLMModel) {
-  await updateModel(row.id, { is_enabled: row.is_enabled });
-  ElMessage.success(row.is_enabled ? "已启用" : "已停用");
-  await store.fetchModels();
+async function toggleEnabled(row: LLMModel, val: boolean) {
+  try {
+    await updateModel(row.id, { is_enabled: val });
+    row.is_enabled = val;
+    ElMessage.success(val ? "已启用" : "已停用");
+  } catch {
+    ElMessage.error("操作失败,请重试");
+  }
 }
 
 const healthChecking = ref<Set<number>>(new Set());
@@ -218,7 +222,10 @@ async function healthCheck(row: LLMModel) {
     </el-table-column>
     <el-table-column label="启用" width="70">
       <template #default="{ row }">
-        <el-switch :model-value="row.is_enabled" @change="toggleEnabled(row)" />
+        <el-switch
+          :model-value="row.is_enabled"
+          @change="(val: boolean) => toggleEnabled(row, val)"
+        />
       </template>
     </el-table-column>
     <el-table-column label="操作" width="290" fixed="right">

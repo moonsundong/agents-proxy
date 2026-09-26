@@ -116,10 +116,14 @@ async function remove(row: RoutingPolicy) {
   await fetchPolicies();
 }
 
-async function toggleActive(row: RoutingPolicy) {
-  await updatePolicy(row.id, { is_active: row.is_active });
-  ElMessage.success(row.is_active ? "已启用" : "已停用");
-  await fetchPolicies();
+async function toggleActive(row: RoutingPolicy, val: boolean) {
+  try {
+    await updatePolicy(row.id, { is_active: val });
+    row.is_active = val;
+    ElMessage.success(val ? "已启用" : "已停用");
+  } catch {
+    ElMessage.error("操作失败,请重试");
+  }
 }
 </script>
 
@@ -163,7 +167,10 @@ async function toggleActive(row: RoutingPolicy) {
     </el-table-column>
     <el-table-column label="启用" width="70">
       <template #default="{ row }">
-        <el-switch :model-value="row.is_active" @change="toggleActive(row)" />
+        <el-switch
+          :model-value="row.is_active"
+          @change="(val: boolean) => toggleActive(row, val)"
+        />
       </template>
     </el-table-column>
     <el-table-column label="操作" width="150" fixed="right">
