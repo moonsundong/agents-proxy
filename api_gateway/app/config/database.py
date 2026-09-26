@@ -84,6 +84,7 @@ def _apply_column_migrations(sync_conn) -> None:
     migrations = {
         "request_logs": {
             "request_excerpt": "ALTER TABLE request_logs ADD COLUMN request_excerpt TEXT",
+            "source": "ALTER TABLE request_logs ADD COLUMN source TEXT",
         },
         "routing_policies": {
             "decision_content_limit": "ALTER TABLE routing_policies ADD COLUMN decision_content_limit INTEGER NOT NULL DEFAULT 8000",

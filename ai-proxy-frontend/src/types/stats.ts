@@ -14,6 +14,7 @@ export interface RequestLog {
   latency_ms: number | null;
   status: "success" | "error" | "cancelled";
   error: string | null;
+  source: string | null;
   created_at: string;
 }
 

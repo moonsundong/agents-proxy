@@ -161,6 +161,14 @@ const statusLabel = (s: string) =>
       <template #default="{ row }">{{ fmtTime(row.created_at) }}</template>
     </el-table-column>
     <el-table-column prop="model_name" label="模型" min-width="120" />
+    <el-table-column label="来源" width="130">
+      <template #default="{ row }">
+        <el-tag v-if="row.source" type="info" effect="plain">{{
+          row.source
+        }}</el-tag>
+        <span v-else>—</span>
+      </template>
+    </el-table-column>
     <el-table-column label="路由" width="80">
       <template #default="{ row }">
         <el-tag :type="routeTag(row.route)">{{ routeLabel(row.route) }}</el-tag>

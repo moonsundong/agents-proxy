@@ -73,6 +73,38 @@ def reset_breakers() -> None:
     _breakers.clear()
 
 
+# ---------------------------------------------------------------- 客户端来源
+
+# 常见的客户端工具 UA 特征(不区分大小写);命中即显示友好名,否则展示截断的原始 UA
+_SOURCE_PATTERNS: list[tuple[str, str]] = [
+    (r"claude[- ]?code|claude-cli", "Claude Code"),
+    (r"claude\.ai", "Claude.ai"),
+    (r"claude", "Claude"),
+    (r"codex", "Codex"),
+    (r"cursor", "Cursor"),
+    (r"aider", "Aider"),
+    (r"openai[-_ ]?(sdk|python|node)", "OpenAI SDK"),
+    (r"langchain", "LangChain"),
+    (r"llama[-_ ]?index", "LlamaIndex"),
+    (r"python-requests", "Python Requests"),
+    (r"httpx", "HTTPX"),
+    (r"curl", "cURL"),
+    (r"node-fetch|undici|axios", "Node 客户端"),
+]
+
+_SOURCE_FALLBACK_LEN = 64  # 未识别 UA 的展示截断长度
+
+
+def normalize_source(ua: str | None) -> str | None:
+    """从 User-Agent 解析客户端工具名;识别不出返回截断的原始 UA,空 UA 返回 None。"""
+    if not ua or not ua.strip():
+        return None
+    for pattern, label in _SOURCE_PATTERNS:
+        if re.search(pattern, ua, re.IGNORECASE):
+            return label
+    return ua.strip()[:_SOURCE_FALLBACK_LEN]
+
+
 # ---------------------------------------------------------------- 模型选择
 
 
@@ -91,7 +123,9 @@ async def _compression_reference_model(db: AsyncSession) -> LLMModel | None:
     return (await db.execute(stmt)).scalars().first()
 
 
-async def _log_prepare_cancel(req: ChatCompletionRequest, start: float) -> None:
+async def _log_prepare_cancel(
+    req: ChatCompletionRequest, start: float, source: str | None
+) -> None:
     """准备阶段被客户端中断的最小化日志(此时还没有路由结果可记)。"""
     await _insert_log(
         request_id=uuid.uuid4().hex[:12],
@@ -108,11 +142,12 @@ async def _log_prepare_cancel(req: ChatCompletionRequest, start: float) -> None:
         latency_ms=int((time.perf_counter() - start) * 1000),
         status="cancelled",
         error="客户端在压缩/决策阶段中断(准备耗时过长)",
+        source=source,
     )
 
 
 async def _prepare(
-    db: AsyncSession, req: ChatCompletionRequest
+    db: AsyncSession, req: ChatCompletionRequest, source: str | None
 ) -> tuple[LLMModel, decision_service.RouteDecision, CompressOutcome]:
     """压缩 → 路由决策,返回 (参考模型, 路由决策, 压缩结果)。"""
     start = time.perf_counter()
@@ -133,7 +168,7 @@ async def _prepare(
         return ref_model, decision, compression
     except asyncio.CancelledError:
         # 大上下文的压缩可能耗时分钟级,客户端等不及断开时也要留痕
-        task = asyncio.create_task(_log_prepare_cancel(req, start))
+        task = asyncio.create_task(_log_prepare_cancel(req, start, source))
         _BACKGROUND_TASKS.add(task)
         task.add_done_callback(_on_log_task_done)
         raise
@@ -177,6 +212,7 @@ class LogContext:
     compression: CompressOutcome
     excerpt: str
     start: float
+    source: str | None = None  # 客户端工具名(由路由层从 UA 解析后传入)
     # 是否已提交过日志:由 write_log/_log_in_background 在派发时置位,
     # 取消路径据此避免重复补记(同一条请求日志写两次)
     logged: bool = False
@@ -228,6 +264,7 @@ def _log_fields(
         "latency_ms": latency_ms,
         "status": status,
         "error": error,
+        "source": ctx.source,
     }
 
 
@@ -312,10 +349,10 @@ def _log_in_background(
 
 
 async def chat_completion(
-    db: AsyncSession, req: ChatCompletionRequest
+    db: AsyncSession, req: ChatCompletionRequest, source: str | None = None
 ) -> tuple[int, dict]:
     """非流式转发,返回 (HTTP 状态码, 响应体)。"""
-    _, decision, compression = await _prepare(db, req)
+    _, decision, compression = await _prepare(db, req, source)
     model = decision.model
     payload = req.to_upstream_payload(model.model_id)
     payload["messages"] = compression.messages
@@ -329,6 +366,7 @@ async def chat_completion(
         compression=compression,
         excerpt=_request_excerpt(req.messages),
         start=time.perf_counter(),
+        source=source,
     )
     breaker = get_breaker(model.id)
     if breaker.is_open:
@@ -415,13 +453,15 @@ class StreamContext:
     log: LogContext
 
 
-async def prepare_stream(db: AsyncSession, req: ChatCompletionRequest) -> StreamContext:
+async def prepare_stream(
+    db: AsyncSession, req: ChatCompletionRequest, source: str | None = None
+) -> StreamContext:
     """流式转发的准备阶段:压缩 → 路由 → 熔断检查。
 
     必须在 StreamingResponse 建立之前 await,此阶段的异常(如无可用模型)
     才能以正常的 JSON 错误响应返回;一旦流开始,错误只能以 SSE 事件表达。
     """
-    _, decision, compression = await _prepare(db, req)
+    _, decision, compression = await _prepare(db, req, source)
     model = decision.model
     payload = req.to_upstream_payload(model.model_id)
     payload["messages"] = compression.messages
@@ -438,6 +478,7 @@ async def prepare_stream(db: AsyncSession, req: ChatCompletionRequest) -> Stream
         compression=compression,
         excerpt=_request_excerpt(req.messages),
         start=time.perf_counter(),
+        source=source,
     )
     breaker = get_breaker(model.id)
     if breaker.is_open:

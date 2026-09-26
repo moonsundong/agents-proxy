@@ -23,6 +23,7 @@ class RequestLogOut(BaseModel):
     latency_ms: int | None
     status: str
     error: str | None
+    source: str | None
     created_at: datetime
 
 

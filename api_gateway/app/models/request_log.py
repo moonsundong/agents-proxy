@@ -35,4 +35,8 @@ class RequestLog(Base):
     status: Mapped[str] = mapped_column(String(16), default="success")  # success / error
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # 客户端来源:解析后的工具名(Claude/Codex/Cursor/...)或截断的原始 User-Agent;
+    # 无 UA 时回退 metadata.user_id,都没有为 None
+    source: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), index=True)
