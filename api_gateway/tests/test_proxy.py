@@ -344,6 +344,113 @@ async def test_proxy_normalizes_responses_parts_end_to_end(
     assert received[0]["messages"][0]["content"][0]["type"] == "text"
 
 
+# ---------------------------------------------------------------- 上下文溢出回退
+
+_OVERFLOW_BODY = {
+    "error": {
+        "code": 400,
+        "message": "request (184483 tokens) exceeds the available context size (131072 tokens), try increasing it",
+    }
+}
+
+
+async def test_proxy_context_overflow_falls_back_to_larger_window(
+    client: AsyncClient,
+) -> None:
+    """上游按真实 token 数判定超窗口时,自动换窗口最大的启用模型重试。
+
+    护栏用的是估算 token,代码类会话实际 token 可达估算的 1.5 倍
+    (2026-09-27 codex 184483 tokens 被 llama-server 400 拒绝事故)。
+    """
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        calls.append(body["model"])
+        if body["model"] == "bonsai-27b":
+            return httpx.Response(400, json=_OVERFLOW_BODY)
+        return _ok_completion()
+
+    llm_client.set_client(_mock_upstream(handler))
+    await _seed_model(client)  # local-bonsai 默认, ctx 65536
+    await _seed_model(
+        client,
+        name="k3",
+        type="openai",
+        model_id="k3",
+        context_window=1048576,
+        is_default=False,
+    )
+
+    resp = await client.post("/v1/chat/completions", json=_MSG)
+    assert resp.status_code == 200
+    assert calls == ["bonsai-27b", "k3"]  # 溢出后自动换大窗口模型
+
+    logs = await _logs()
+    assert logs[0].status == "success"
+    assert logs[0].model_name == "k3"
+    assert logs[0].route == "cloud"
+    assert "回退 k3" in logs[0].route_reason
+
+
+async def test_proxy_context_overflow_without_fallback_passthrough(
+    client: AsyncClient,
+) -> None:
+    """没有更大窗口的模型可换时,原 400 照常透传(不捏造成功)。"""
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(400, json=_OVERFLOW_BODY)
+
+    llm_client.set_client(_mock_upstream(handler))
+    await _seed_model(client)
+
+    resp = await client.post("/v1/chat/completions", json=_MSG)
+    assert resp.status_code == 400
+    assert calls == 1  # 无回退不重试
+
+    logs = await _logs()
+    assert logs[0].status == "error"
+    assert "exceeds the available context size" in logs[0].error
+
+
+async def test_proxy_stream_context_overflow_falls_back(client: AsyncClient) -> None:
+    """流式建连阶段的上下文溢出同样换模型重试。"""
+    received: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        received.append(body["model"])
+        if body["model"] == "bonsai-27b":
+            return httpx.Response(400, json=_OVERFLOW_BODY)
+        return httpx.Response(
+            200, content=_SSE_BODY.encode(), headers={"content-type": "text/event-stream"}
+        )
+
+    llm_client.set_client(_mock_upstream(handler))
+    await _seed_model(client)
+    await _seed_model(
+        client,
+        name="k3",
+        type="openai",
+        model_id="k3",
+        context_window=1048576,
+        is_default=False,
+    )
+
+    resp = await client.post("/v1/chat/completions", json={**_MSG, "stream": True})
+    assert resp.status_code == 200
+    assert "Hel" in resp.text
+    assert received == ["bonsai-27b", "k3"]
+
+    logs = await _logs()
+    assert logs[0].status == "success"
+    assert logs[0].model_name == "k3"
+    assert "回退 k3" in logs[0].route_reason
+
+
 # ---------------------------------------------------------------- 流式
 
 

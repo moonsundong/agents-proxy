@@ -232,6 +232,65 @@ async def test_low_confidence_routes_cloud(client: AsyncClient) -> None:
     assert "命中区间" in logs[0].route_reason
 
 
+async def test_overflow_fallback_follows_tier_chain(client: AsyncClient) -> None:
+    """上游超窗回退沿策略区间链走,不跳出策略挑全局最大窗口的模型。
+
+    背景(2026-09-27):策略 [≥0.5→本地, ≥0.0→360-k3],另有一个同窗口的
+    k3 挂在周配额已用尽的账号;全局最大窗口启发式误选它导致 403 连环失败。
+    """
+    calls = {"decision": 0, "local": 0, "cloud": 0, "decoy": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        host = request.url.host
+        if host == "decision.test":
+            calls["decision"] += 1
+            return _completion(json.dumps({"confidence": 0.9, "reason": "简单"}, ensure_ascii=False))
+        if host == "local.test":
+            calls["local"] += 1
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "message": "request (99999 tokens) exceeds the available context size (8192 tokens)"
+                    }
+                },
+            )
+        if host == "cloud.test":
+            calls["cloud"] += 1
+            return _completion("cloud-answer")
+        if host == "decoy.test":
+            calls["decoy"] += 1
+            return _completion("decoy-answer")
+        raise AssertionError(f"未知上游: {host}")
+
+    llm_client.set_client(httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    ids = await _seed_models(client)
+    await _create_policy(client, ids)
+    # 诱饵:窗口比线上档还大但不在策略里;启发式会选它,区间链不会
+    resp = await client.post(
+        "/api/models",
+        json={
+            "name": "big-decoy",
+            "type": "openai",
+            "base_url": "http://decoy.test",
+            "model_id": "decoy-1",
+            "context_window": 2097152,
+            "is_default": False,
+        },
+    )
+    assert resp.status_code == 201
+
+    resp = await client.post("/v1/chat/completions", json=_MSG)
+    assert resp.status_code == 200
+    assert resp.json()["choices"][0]["message"]["content"] == "cloud-answer"
+    assert calls == {"decision": 1, "local": 1, "cloud": 1, "decoy": 0}
+
+    logs = await _logs()
+    assert logs[0].model_name == "gpt-4o"
+    assert logs[0].route == "cloud"
+    assert "回退 gpt-4o" in logs[0].route_reason
+
+
 async def test_decision_receives_compressed_messages(client: AsyncClient) -> None:
     """决策模型评估的应是压缩后的消息(文档模块 5 决策流程)。"""
     seen: list[dict] = []

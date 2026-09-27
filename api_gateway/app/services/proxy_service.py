@@ -24,7 +24,7 @@ from app.clients import llm_client
 from app.clients.headroom_client import CompressOutcome, estimate_tokens
 from app.config.database import async_session_factory
 from app.config.settings import settings
-from app.models.llm_model import LLMModel
+from app.models.llm_model import LLMModel, ModelType
 from app.models.request_log import RequestLog
 from app.schemas.proxy import ChatCompletionRequest
 from app.services import compression_service, decision_service
@@ -134,6 +134,59 @@ def normalize_messages(messages: list[dict]) -> list[dict]:
                 changed = True
         out.append(msg)
     return out if changed else messages
+
+
+# ---------------------------------------------------------------- 上下文溢出回退
+
+# 上游按真实 token 数拒绝时的识别特征(估算偏低会漏过窗口护栏,只有上游的
+# 计数才是事实):llama-server / OpenAI 系各自的文案与错误码
+_OVERFLOW_PATTERNS = (
+    "exceeds the available context size",  # llama-server
+    "context_length_exceeded",  # OpenAI 系错误码
+    "maximum context length",  # OpenAI 系文案
+)
+
+
+def _is_context_overflow(status_code: int, body: str) -> bool:
+    """上游错误是否为"超出上下文窗口"——唯一值得自动换模型重试的 4xx。"""
+    if status_code not in (400, 413, 422):
+        return False
+    low = body.lower()
+    return any(p in low for p in _OVERFLOW_PATTERNS)
+
+
+def _pick_overflow_fallback(chain: list[LLMModel], current: LLMModel) -> LLMModel | None:
+    """从策略溢出回退链取下一个候选:跳过当前模型、熔断开路、窗口不比当前大的。
+
+    超窗意味着需要更大的窗口,同/更小窗口的下一档必然同样被拒,跳过省一次往返。
+    """
+    for candidate in chain:
+        if candidate.id == current.id:
+            continue
+        if candidate.context_window <= current.context_window:
+            continue
+        if get_breaker(candidate.id).is_open:
+            continue
+        return candidate
+    return None
+
+
+async def _context_overflow_fallback(failed: LLMModel) -> LLMModel | None:
+    """上下文溢出兜底:换窗口最大的启用模型。
+
+    用独立会话(流式路径里请求级会话生命周期不可靠);
+    没有更大窗口的模型可换时返回 None,原错误照常透传。
+    """
+    async with async_session_factory() as session:
+        stmt = (
+            select(LLMModel)
+            .where(LLMModel.is_enabled.is_(True), LLMModel.id != failed.id)
+            .order_by(LLMModel.context_window.desc(), LLMModel.priority, LLMModel.id)
+        )
+        candidate = (await session.execute(stmt)).scalars().first()
+        if candidate is not None and candidate.context_window <= failed.context_window:
+            return None
+        return candidate
 
 
 # ---------------------------------------------------------------- 模型选择
@@ -412,6 +465,7 @@ async def chat_completion(
         )
 
     last_exc: Exception | None = None
+    overflow_fallback_tried = False  # 上下文溢出换模型只试一次,防循环
     try:
         for attempt in range(settings.llm_max_retries + 1):
             try:
@@ -443,6 +497,27 @@ async def chat_completion(
                     completion_tokens=usage.get("completion_tokens"),
                 )
             else:
+                # 上游按真实 token 数拒绝(估算偏低漏过护栏):先沿策略区间链
+                # 回退(下一档才是用户意图),链空再全局挑窗口最大的启用模型
+                if _is_context_overflow(resp.status_code, resp.text) and (
+                    not overflow_fallback_tried
+                ):
+                    fallback = _pick_overflow_fallback(decision.fallback_models, model)
+                    if fallback is None:
+                        fallback = await _context_overflow_fallback(model)
+                    if fallback is not None and not get_breaker(fallback.id).is_open:
+                        overflow_fallback_tried = True
+                        ctx.route_reason += (
+                            f";{model.name} 实际超出上下文窗口,回退 {fallback.name}"
+                        )
+                        model = fallback
+                        payload = {**payload, "model": fallback.model_id}
+                        ctx.model = fallback
+                        ctx.route = (
+                            "local" if fallback.type == ModelType.LOCAL else "cloud"
+                        )
+                        breaker = get_breaker(fallback.id)
+                        continue
                 # 熔断按逻辑请求计数(重试不重复计数);4xx(429 除外)是
                 # 客户端/payload 问题,不代表上游不健康,不计熔断——
                 # 否则个别坏请求会把后续好请求全挡掉
@@ -487,6 +562,7 @@ class StreamContext:
     model: LLMModel
     payload: dict
     log: LogContext
+    fallback_models: list[LLMModel]  # 溢出回退链(来自策略区间,可能为空)
 
 
 async def prepare_stream(
@@ -524,7 +600,9 @@ async def prepare_stream(
             status_code=503,
             code="CIRCUIT_OPEN",
         )
-    return StreamContext(model=model, payload=payload, log=ctx)
+    return StreamContext(
+        model=model, payload=payload, log=ctx, fallback_models=decision.fallback_models
+    )
 
 
 async def _with_keepalive(model: LLMModel, payload: dict) -> AsyncGenerator[bytes, None]:
@@ -582,6 +660,7 @@ async def stream_generator(sc: StreamContext) -> AsyncGenerator[bytes, None]:
     usage: dict = {}
     last_exc: Exception | None = None
     finish_seen = False  # 客户端是否已拿到完整响应(非 null finish_reason)
+    overflow_fallback_tried = False  # 上下文溢出换模型只试一次,防循环
 
     try:
         for attempt in range(settings.llm_max_retries + 1):
@@ -610,6 +689,31 @@ async def stream_generator(sc: StreamContext) -> AsyncGenerator[bytes, None]:
                 if stream_started:
                     # 流已开始,不能重试:以 SSE 错误事件收尾
                     break
+                # 流未开始时的上下文溢出:先沿策略区间链回退,链空再全局
+                # 挑窗口最大的启用模型
+                if (
+                    isinstance(exc, llm_client.UpstreamError)
+                    and not overflow_fallback_tried
+                    and _is_context_overflow(
+                        exc.status_code, exc.body.decode("utf-8", errors="ignore")
+                    )
+                ):
+                    fallback = _pick_overflow_fallback(sc.fallback_models, model)
+                    if fallback is None:
+                        fallback = await _context_overflow_fallback(model)
+                    if fallback is not None and not get_breaker(fallback.id).is_open:
+                        overflow_fallback_tried = True
+                        ctx.route_reason += (
+                            f";{model.name} 实际超出上下文窗口,回退 {fallback.name}"
+                        )
+                        model = fallback
+                        payload = {**payload, "model": fallback.model_id}
+                        ctx.model = fallback
+                        ctx.route = (
+                            "local" if fallback.type == ModelType.LOCAL else "cloud"
+                        )
+                        breaker = get_breaker(fallback.id)
+                        continue
                 if isinstance(exc, llm_client.UpstreamError) and (
                     exc.status_code not in _RETRYABLE_STATUS
                     or attempt >= settings.llm_max_retries

@@ -10,7 +10,7 @@
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import httpx
 from loguru import logger
@@ -63,6 +63,10 @@ class RouteDecision:
     route: str  # local / cloud / manual
     confidence: float | None
     reason: str
+    # 选中档之下的可用区间候选(按档降序):上游按真实 token 数判定超窗时,
+    # 转发层沿链回退——策略里的下一档才是用户意图,不能跳出策略全局挑
+    # 窗口最大的(不同模型可能挂不同账号/额度)
+    fallback_models: list[LLMModel] = field(default_factory=list)
 
 
 def _route_of(model: LLMModel) -> str:
@@ -216,6 +220,8 @@ async def _resolve_by_tiers(
     选中区间的模型不可用时顺延到下一个区间;压缩后的 prompt 超出区间模型
     上下文窗口时同样顺延(窗口是物理约束,置信度再高也装不下)。
     所有区间都不命中(置信度低于最低下限)时保守回退默认模型。
+    选中档之下的可用区间挂到 fallback_models,供转发层在上游按真实
+    token 数判定超窗时沿链回退(估算可能偏低漏过护栏)。
     """
     tiers = sorted(
         policy.decision_tiers or [],
@@ -223,8 +229,16 @@ async def _resolve_by_tiers(
         reverse=True,
     )
     detail = info.reason or info.complexity or "无"
+
+    def _fits(model: LLMModel) -> bool:
+        return (
+            prompt_tokens is None
+            or prompt_tokens <= model.context_window - _CONTEXT_RESERVE
+        )
+
     skipped: list[str] = []
-    for tier in tiers:
+    chosen: tuple[float, LLMModel, int] | None = None
+    for idx, tier in enumerate(tiers):
         low = float(tier["min_confidence"])
         if info.confidence < low:
             continue
@@ -232,33 +246,47 @@ async def _resolve_by_tiers(
         if model is None:
             skipped.append(f"区间 ≥{low:.2f} 的模型不可用")
             continue
-        if (
-            prompt_tokens is not None
-            and prompt_tokens > model.context_window - _CONTEXT_RESERVE
-        ):
+        if not _fits(model):
             skipped.append(
                 f"{model.name} 窗口 {model.context_window} 装不下约 {prompt_tokens} tokens"
             )
             continue
+        chosen = (low, model, idx)
+        break
+
+    if chosen is None:
+        default = await _default_model(db)
         suffix = f";已跳过: {';'.join(skipped)}" if skipped else ""
         return RouteDecision(
-            model=model,
-            route=_route_of(model),
+            model=default,
+            route=_route_of(default),
             confidence=info.confidence,
             reason=(
-                f"置信度 {info.confidence:.2f} 命中区间 ≥{low:.2f} → {model.name}"
-                f"({detail}){suffix}"
+                f"置信度 {info.confidence:.2f} 低于所有区间下限({detail}),回退默认模型{suffix}"
             ),
         )
-    default = await _default_model(db)
+
+    low, model, chosen_idx = chosen
+    # 溢出回退链:选中档之下的可用区间模型,按档降序、去重、估算装得下的
+    chain: list[LLMModel] = []
+    seen = {model.id}
+    for tier in tiers[chosen_idx + 1 :]:
+        candidate = await _enabled_model_or_none(db, tier.get("model_id"))
+        if candidate is None or candidate.id in seen or not _fits(candidate):
+            continue
+        seen.add(candidate.id)
+        chain.append(candidate)
+
     suffix = f";已跳过: {';'.join(skipped)}" if skipped else ""
     return RouteDecision(
-        model=default,
-        route=_route_of(default),
+        model=model,
+        route=_route_of(model),
         confidence=info.confidence,
         reason=(
-            f"置信度 {info.confidence:.2f} 低于所有区间下限({detail}),回退默认模型{suffix}"
+            f"置信度 {info.confidence:.2f} 命中区间 ≥{low:.2f} → {model.name}"
+            f"({detail}){suffix}"
         ),
+        fallback_models=chain,
     )
 
 
