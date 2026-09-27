@@ -105,6 +105,37 @@ def normalize_source(ua: str | None) -> str | None:
     return ua.strip()[:_SOURCE_FALLBACK_LEN]
 
 
+# ---------------------------------------------------------------- 消息规范化
+
+# codex 等客户端会把 Responses API 的内容段类型(input_text/output_text)混进
+# chat/completions 请求;llama-server 严格校验 content[].type,不认的类型直接 400
+_CONTENT_PART_ALIAS = {"input_text": "text", "output_text": "text"}
+
+
+def normalize_messages(messages: list[dict]) -> list[dict]:
+    """把 Responses 风格的内容段类型转换为 chat 风格(input_text→text 等)。
+
+    无需改动的消息保持原对象,避免大 payload 的无谓深拷贝。
+    """
+    out: list[dict] = []
+    changed = False
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            new_parts = []
+            msg_changed = False
+            for part in content:
+                if isinstance(part, dict) and part.get("type") in _CONTENT_PART_ALIAS:
+                    part = {**part, "type": _CONTENT_PART_ALIAS[part["type"]]}
+                    msg_changed = True
+                new_parts.append(part)
+            if msg_changed:
+                msg = {**msg, "content": new_parts}
+                changed = True
+        out.append(msg)
+    return out if changed else messages
+
+
 # ---------------------------------------------------------------- 模型选择
 
 
@@ -355,7 +386,7 @@ async def chat_completion(
     _, decision, compression = await _prepare(db, req, source)
     model = decision.model
     payload = req.to_upstream_payload(model.model_id)
-    payload["messages"] = compression.messages
+    payload["messages"] = normalize_messages(compression.messages)
 
     ctx = LogContext(
         request_id=uuid.uuid4().hex[:12],
@@ -412,13 +443,18 @@ async def chat_completion(
                     completion_tokens=usage.get("completion_tokens"),
                 )
             else:
-                # 熔断按逻辑请求计数(重试不重复计数)
-                breaker.record_failure()
+                # 熔断按逻辑请求计数(重试不重复计数);4xx(429 除外)是
+                # 客户端/payload 问题,不代表上游不健康,不计熔断——
+                # 否则个别坏请求会把后续好请求全挡掉
+                if not (400 <= resp.status_code < 500 and resp.status_code != 429):
+                    breaker.record_failure()
+                # 错误体截断入日志:4xx 的具体原因(如 unsupported content[].type)
+                # 只在上游响应里,不带正文日志就是"upstream HTTP 400"一句废话
                 await write_log(
                     ctx,
                     status="error",
                     latency_ms=latency,
-                    error=f"upstream HTTP {resp.status_code}",
+                    error=f"upstream HTTP {resp.status_code}: {resp.text[:300]}",
                 )
             return resp.status_code, body
 
@@ -464,7 +500,7 @@ async def prepare_stream(
     _, decision, compression = await _prepare(db, req, source)
     model = decision.model
     payload = req.to_upstream_payload(model.model_id)
-    payload["messages"] = compression.messages
+    payload["messages"] = normalize_messages(compression.messages)
     payload["stream"] = True
     # 让兼容后端在流末尾回传 token 用量,用于日志统计
     payload.setdefault("stream_options", {"include_usage": True})
@@ -578,10 +614,15 @@ async def stream_generator(sc: StreamContext) -> AsyncGenerator[bytes, None]:
                     exc.status_code not in _RETRYABLE_STATUS
                     or attempt >= settings.llm_max_retries
                 ):
-                    # 不可重试的上游错误:透传状态码与错误体
-                    breaker.record_failure()
+                    # 不可重试的上游错误:透传状态码与错误体;
+                    # 4xx 属 payload 问题不计熔断(429 在 _RETRYABLE_STATUS 里,到不了这)
+                    if not 400 <= exc.status_code < 500:
+                        breaker.record_failure()
+                    body_preview = exc.body[:300].decode("utf-8", errors="ignore")
                     _log_in_background(
-                        ctx, status="error", error=f"upstream HTTP {exc.status_code}"
+                        ctx,
+                        status="error",
+                        error=f"upstream HTTP {exc.status_code}: {body_preview}",
                     )
                     yield _sse_raw(exc.body)
                     return
@@ -590,8 +631,9 @@ async def stream_generator(sc: StreamContext) -> AsyncGenerator[bytes, None]:
                 continue
 
         breaker.record_failure()
-        _log_in_background(ctx, status="error", error=f"流式调用失败: {last_exc}")
-        yield _sse_error(f"流式调用失败(已重试 {settings.llm_max_retries} 次): {last_exc}", "STREAM_FAILED")
+        # repr:httpx 超时异常的 str 是空串,直接插值日志里只剩"流式调用失败: "
+        _log_in_background(ctx, status="error", error=f"流式调用失败: {last_exc!r}")
+        yield _sse_error(f"流式调用失败(已重试 {settings.llm_max_retries} 次): {last_exc!r}", "STREAM_FAILED")
     finally:
         if not ctx.logged:
             if finish_seen:

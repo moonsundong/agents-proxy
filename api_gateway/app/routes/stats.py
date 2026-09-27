@@ -22,7 +22,7 @@ async def get_logs(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=200),
     route: str | None = Query(default=None, pattern="^(local|cloud|manual)$"),
-    status: str | None = Query(default=None, pattern="^(success|error)$"),
+    status: str | None = Query(default=None, pattern="^(success|error|cancelled)$"),
     model_name: str | None = None,
     days: int | None = Query(default=None, ge=1, le=90),
 ) -> LogPage:

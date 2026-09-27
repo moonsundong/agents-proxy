@@ -273,6 +273,77 @@ async def test_proxy_upstream_4xx_passthrough_no_retry(client: AsyncClient) -> N
     assert calls == 1  # 4xx 不重试
 
 
+async def test_proxy_upstream_4xx_does_not_trip_breaker(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """4xx 是 payload 问题而非上游不健康:连续 400 不得开路熔断器,
+    否则个别坏请求会把后续好请求全部挡掉(2026-09-27 本地批量失败事故)。"""
+    monkeypatch.setattr(settings, "circuit_failure_threshold", 3)
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(400, json={"error": {"message": "bad request"}})
+
+    llm_client.set_client(_mock_upstream(handler))
+    await _seed_model(client)
+
+    for _ in range(4):
+        resp = await client.post("/v1/chat/completions", json=_MSG)
+        assert resp.status_code == 400
+    assert calls == 4  # 每次都打到上游,没有被熔断器拦截
+
+
+def test_normalize_messages_aliases_responses_content_parts() -> None:
+    """codex 会把 Responses API 的 input_text/output_text 段混进 chat 请求,
+    llama-server 严格校验 content[].type 会 400;网关统一转成 text。"""
+    msgs = [
+        {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+        {"role": "assistant", "content": [{"type": "output_text", "text": "yo"}]},
+        {"role": "user", "content": "plain"},
+        {"role": "user", "content": [{"type": "text", "text": "keep"}]},
+    ]
+    out = proxy_service.normalize_messages(msgs)
+    assert out[0]["content"][0] == {"type": "text", "text": "hi"}
+    assert out[1]["content"][0] == {"type": "text", "text": "yo"}
+    # 无需改动的消息保持原对象,不做无谓拷贝
+    assert out[2] is msgs[2]
+    assert out[3] is msgs[3]
+    # 原输入不被就地修改
+    assert msgs[0]["content"][0]["type"] == "input_text"
+
+    untouched = [{"role": "user", "content": "plain"}]
+    assert proxy_service.normalize_messages(untouched) is untouched
+
+
+async def test_proxy_normalizes_responses_parts_end_to_end(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """端到端:带 input_text 段的请求经网关后,上游收到的是 text 段。"""
+    # 压缩直通:保留原始消息结构(小请求本就不会触发真实压缩)
+    monkeypatch.setattr(headroom_client, "HEADROOM_AVAILABLE", False)
+    received: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        received.append(json.loads(request.content))
+        return _ok_completion()
+
+    llm_client.set_client(_mock_upstream(handler))
+    await _seed_model(client)
+
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [
+                {"role": "user", "content": [{"type": "input_text", "text": "你好"}]}
+            ]
+        },
+    )
+    assert resp.status_code == 200
+    assert received[0]["messages"][0]["content"][0]["type"] == "text"
+
+
 # ---------------------------------------------------------------- 流式
 
 
